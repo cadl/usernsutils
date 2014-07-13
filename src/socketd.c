@@ -9,7 +9,6 @@
 #include <unistd.h>
 
 
-
 #define PERROR(condition, func, ...)		\
   if( (func(__VA_ARGS__))condition) {		\
     perror(#func"("#__VA_ARGS__")");		\
@@ -27,12 +26,10 @@
 
 static int verbose = 0;
 static char *socket_path = NULL;
-static char *shell = NULL;
 
 
 static struct option options[] = {
   {"listen",       required_argument, NULL, 'l'},
-  {"shell",        required_argument, NULL, 's'},
 
   {"verbose",      no_argument,       NULL, 'v'},
   {"help",         no_argument,       NULL, 'h'},
@@ -41,19 +38,16 @@ static struct option options[] = {
 };
 
 
-
 void show_usage(char const *name) {
   printf("Usage: %s [options] [--] [command]\n", name);
   printf("\n"
 	 "  -l, --listen=PATH          PATH to unix domain socket\n"
-	 "  -s, --shell=SHELL          path to shell\n"
 	 "\n"
 	 "  -v, --verbose              verbose\n"
 	 "  -h, --help                 print help message and exit\n"
 	 );
   exit(0);
 }
-
 
 
 void handle_connection(int fd);
@@ -64,7 +58,7 @@ void sigint_handler(int signum);
 int main(int argc, char *const argv[]) {
   int opt, index;
 
-  while((opt = getopt_long(argc, argv, "+l:s:hv", options, &index)) != -1) {
+  while((opt = getopt_long(argc, argv, "+l:hv", options, &index)) != -1) {
     switch(opt) {
     case '?':
       goto err;
@@ -75,10 +69,6 @@ int main(int argc, char *const argv[]) {
 
     case 'l':
       socket_path = optarg;
-      break;
-
-    case 's':
-      shell = optarg;
       break;
 
     case 'v':
@@ -93,14 +83,6 @@ int main(int argc, char *const argv[]) {
   if (!socket_path) {
     fprintf(stderr, "listen path expected\n");
     goto err;
-  }
-
-  if (!shell) {
-    shell = getenv("SHELL");
-  }
-
-  if (!shell) {
-    shell = "/bin/sh";
   }
 
   int listen_fd = -1;
@@ -148,8 +130,8 @@ int main(int argc, char *const argv[]) {
 err:
   fprintf(stderr, "Try '%s --help'\n", argv[0]);
   exit(EXIT_FAILURE);
-}
 
+}
 
 
 void cleanup(){
@@ -167,83 +149,55 @@ void sigint_handler(int signum) {
 
 
 void handle_connection(int fd) {
-  char control[CMSG_SPACE(sizeof(int))];
-  char n = 0;
+  for(;;) {
+    char sock_type = -1;
+    ssize_t length = recv(fd, &sock_type, 1, 0);
 
-  struct iovec iov = {.iov_base = &n, .iov_len = 1};
-  struct msghdr msg = {
-    .msg_name = NULL,
-    .msg_namelen = 0,
-    .msg_iov = &iov,
-    .msg_iovlen = 1,
-    .msg_control = control,
-    .msg_controllen = CMSG_LEN(sizeof(int)),
-    .msg_flags = 0,
-  };
-  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  *((int *)CMSG_DATA(cmsg)) = -1;
+    if (length < 0) {
+      continue;
+    }
 
-  PERROR(==-1, recvmsg, fd, &msg, 0);
-
-  cmsg = CMSG_FIRSTHDR(&msg);
-
-  if (cmsg==NULL ||
-      cmsg->cmsg_level != SOL_SOCKET ||
-      cmsg->cmsg_type != SCM_RIGHTS) {
-    fprintf(stderr, "cmsg: bad message!\n");
-    exit(EXIT_FAILURE);
-  }
-
-  int slave = *((int *)CMSG_DATA(cmsg));
-  close(fd);
-
-  int ttyfd = open("/dev/tty", O_RDWR | O_NOCTTY);
-  if (ttyfd != -1) {
-    PERROR(==-1, ioctl, ttyfd, TIOCNOTTY);
-    close(ttyfd);
-  }
-
-  PERROR(==-1, setsid);
-  PERROR(==-1, ioctl, slave, TIOCSCTTY);
-
-  pid_t pid;
-  PERROR(==-1, pid = fork);
-  VERBOSE("SPAWN pid=%d\n", pid);
-
-  if (pid > 0) {
-    close(slave);
-
-    for(;;) {
-      int status = -1;
-      pid_t child_pid = waitpid(pid, &status, 0);
-
-      if (WIFSTOPPED(status)) {
-        continue;
-      }
-
-      int code = 1;
-
-      if(WIFSIGNALED(status)) {
-        code = WTERMSIG(status)+128;
-      } else {
-        code = WEXITSTATUS(status);
-      }
-
-      VERBOSE("EXIT pid=%d status=%d\n", child_pid, code);
+    if (length == 0) {
       break;
     }
-    return;
+
+    int sockfd = -1;
+
+    if (sock_type == SOCK_STREAM) {
+      sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    } else if (sock_type == SOCK_DGRAM) {
+      sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    } else {
+      fprintf(stderr, "invalid socket type %d\n", sock_type);
+      exit(EXIT_FAILURE);
+    }
+
+    size_t controllen = sizeof(int);
+    char control[CMSG_SPACE(sizeof(int))];
+    char n = 0;
+
+    struct iovec iov = {.iov_base = &n, .iov_len = 1};
+    struct msghdr msg = {
+      .msg_name = NULL,
+      .msg_namelen = 0,
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = CMSG_LEN(controllen),
+      .msg_flags = 0,
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = msg.msg_controllen;
+
+    int fds[1] = {sockfd};
+    memcpy((int *) CMSG_DATA(cmsg), fds, controllen);
+    PERROR(==-1, sendmsg, fd, &msg, 0);
+    close(sockfd);
   }
 
-  int close_fds[3] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
-
-  int i;
-  for(i=0; i<3; i++) {
-    close(close_fds[i]);
-    dup2(slave, close_fds[i]);
-  }
-  close(slave);
-
-  char *const argv[] = {shell, NULL};
-  PERROR(==-1, execvp, shell, argv);
+  close(fd);
+  exit(0);
 }

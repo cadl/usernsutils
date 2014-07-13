@@ -70,7 +70,7 @@ def main(path):
         conn, _ = s.accept()
         pid = os.fork()
 
-        if (pid == 0):
+        if pid == 0:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
